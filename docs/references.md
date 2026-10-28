@@ -32,4 +32,6 @@ While building for the Hackathon, my targets are:
 So my strategy while building for the hackathon is this loop:
 1. Spend some time to gain solid foundations about the task need to be done, stick to [TASK.md](TASK.md) and using the main resources as mentioned above.
 2. Dive deeper into the task, the [examples](examples), the [problems](problems) to clearly understand them.
-3. Whenever I got stuck or not understand how the Compiler work for the task yet, I get back to the book and documentation, with Cursor help, till fully understand what everything work, how they work, and why work that way. 
+3. Whenever I got stuck or not understand how the Compiler work for the task yet, I get back to the book and documentation, with Cursor help, till fully understand what everything work, how they work, and why work that way.
+
+I go one category at a time, and the compiler from the previous category is the foundation. I only add the lowering and the ops that the category I am on needs, from what its own problems show. When it passes, I submit the earlier categories again, to check the new compiler still covers them, then I move on.

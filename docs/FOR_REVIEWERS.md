@@ -23,7 +23,7 @@ All of category 1, from the repository root ([`01_pointwise.sh`](../tests/by_cat
 bash tests/by_categories/01_pointwise.sh
 ```
 
-Each problem prints a header, then a register count and `PASS` or `FAIL`. The last line is how many problems passed:
+Each problem prints a header, then a register count and `PASS` or `FAIL`. The last line is how many problems passed. For example with category 1:
 
 ```text
 ---- p00_scalar_add ----
@@ -45,9 +45,11 @@ Each problem prints a header, then a register count and `PASS` or `FAIL`. The la
 ## Additional Read about the submission
 
 1. [Architecture](architecture.md)
-2. [Categories](../README.md#docs), in order, pointwise through attention-like
+2. Categories, in order: [pointwise](categories/01-pointwise.md), [reductions](categories/02-reductions.md), [matmul (TBD)](categories/03-matmul.md), [fused (TBD)](categories/04-fused.md), [attention-like (TBD)](categories/05-attention.md)
 3. [References](references.md)
 
 ## Scope
 
 Category 1 (pointwise) passes: `bash tests/by_categories/01_pointwise.sh` reports `4/4 passed`.
+
+Category 2 (reductions) passes: `bash tests/by_categories/02_reductions.sh` reports `4/4 passed`.
