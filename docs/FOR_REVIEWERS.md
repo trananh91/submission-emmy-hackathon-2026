@@ -45,7 +45,7 @@ Each problem prints a header, then a register count and `PASS` or `FAIL`. The la
 ## Additional Read about the submission
 
 1. [Architecture](architecture.md)
-2. Categories, in order: [pointwise](categories/01-pointwise.md), [reductions](categories/02-reductions.md), [matmul (TBD)](categories/03-matmul.md), [fused (TBD)](categories/04-fused.md), [attention-like (TBD)](categories/05-attention.md)
+2. Categories, in order: [pointwise](categories/01-pointwise.md), [reductions](categories/02-reductions.md), [matmul](categories/03-matmul.md), [fused (TBD)](categories/04-fused.md), [attention-like (TBD)](categories/05-attention.md)
 3. [References](references.md)
 
 ## Scope
@@ -53,3 +53,5 @@ Each problem prints a header, then a register count and `PASS` or `FAIL`. The la
 Category 1 (pointwise) passes: `bash tests/by_categories/01_pointwise.sh` reports `4/4 passed`.
 
 Category 2 (reductions) passes: `bash tests/by_categories/02_reductions.sh` reports `4/4 passed`.
+
+Category 3 (matmul) passes: `bash tests/by_categories/03_matmul.sh` reports `2/2 passed`.

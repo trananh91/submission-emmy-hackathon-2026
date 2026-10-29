@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kernel IR -> PTX for pointwise kernels and block reductions.
+"""Kernel IR -> PTX for pointwise kernels, block reductions, and matmul.
 
     python compile.py path/to/<kernel>.ir.json > out.ptx
 
@@ -32,6 +32,10 @@ class Emitter:
         self.axes: dict[str, str] = {}
         self.shapes: dict[str, tuple[int, ...]] = {}
         self.smem: set[str] = set()
+        self.smem_bytes = 0
+        self.smem_used = 0
+        self.smem_off: dict[str, int] = {}
+        self.smem_symbol: dict[str, str] = {}
         self.tid: str | None = None
         self._lab = 0
 
@@ -95,15 +99,19 @@ def kernel_op(graph):  # §2 entry name is KernelOp.name from the IR.
     raise CompileError("no KernelOp in the IR")
 
 
-def arg_order(ir_path: Path, entry: str) -> list[str]:  # §2 parameter order from meta.json.
+def kernel_launch(ir_path: Path, entry: str) -> dict:  # §1–§2 one meta.json record: arg_order and smem_bytes.
     meta_path = ir_path.parent / "meta.json"
     if not meta_path.exists():
         raise CompileError(f"missing {meta_path}")
     meta = json.loads(meta_path.read_text())
     for kernel in meta["kernels"]:
         if kernel["entry"] == entry:
-            return list(kernel["arg_order"])
+            return kernel
     raise CompileError(f"meta.json has no kernel entry {entry}")
+
+
+def arg_order(ir_path: Path, entry: str) -> list[str]:  # §2 parameter order from meta.json.
+    return list(kernel_launch(ir_path, entry)["arg_order"])
 
 
 def record_shapes(em: Emitter, graph) -> None:  # §5 buffer shapes for row-major indexes.
@@ -130,21 +138,34 @@ def compile_index(em: Emitter, expr) -> str:  # §5 index expressions → b32. l
         dest = em.b32()
         if expr.op == "+":
             em.emit(f"\tadd.s32 {dest}, {left}, {right};")
+        elif expr.op == "-":
+            em.emit(f"\tsub.s32 {dest}, {left}, {right};")
         elif expr.op == "*":
             em.emit(f"\tmul.lo.s32 {dest}, {left}, {right};")
+        elif expr.op == "/":
+            em.emit(f"\tdiv.s32 {dest}, {left}, {right};")
+        elif expr.op == "%":
+            em.emit(f"\trem.s32 {dest}, {left}, {right};")
         else:
             raise CompileError(f"unsupported index op {expr.op}")
+        return dest
+    if kind == "TernaryExpr":
+        pred = compile_pred(em, expr.cond)
+        if_true = compile_index(em, expr.if_true)
+        if_false = compile_index(em, expr.if_false)
+        dest = em.b32()
+        em.emit(f"\tselp.b32 {dest}, {if_true}, {if_false}, {pred};")
         return dest
     raise CompileError(f"unsupported index expr {kind}")
 
 
-def compile_pred(em: Emitter, expr) -> str:  # §5 == and != become setp.
-    if type(expr).__name__ != "BinaryExpr" or expr.op not in ("==", "!="):
+def compile_pred(em: Emitter, expr) -> str:  # §5 ==, !=, and < become setp.
+    if type(expr).__name__ != "BinaryExpr" or expr.op not in ("==", "!=", "<"):
         raise CompileError(f"unsupported predicate {expr}")
     left = compile_index(em, expr.left)
     right = compile_index(em, expr.right)
     pred = em.pred()
-    op = "eq" if expr.op == "==" else "ne"
+    op = {"==": "eq", "!=": "ne", "<": "lt"}[expr.op]
     em.emit(f"\tsetp.{op}.s32 {pred}, {left}, {right};")
     return pred
 
@@ -186,7 +207,10 @@ def address_of(em: Emitter, buf: str, index_reg: str, nbytes: int) -> str:  # §
 
 def shared_addr(em: Emitter, name: str, index_reg: str | None, nbytes: int) -> str:  # §5 index → shared address.
     base = em.b32()
-    em.emit(f"\tmov.u32 {base}, {name};")
+    em.emit(f"\tmov.u32 {base}, {em.smem_symbol.get(name, name)};")
+    byte_off = em.smem_off.get(name, 0)
+    if byte_off:
+        em.emit(f"\tadd.s32 {base}, {base}, {byte_off};")
     if index_reg is None:
         return base
     off = em.b32()
@@ -205,7 +229,7 @@ BIN_F32 = {
 
 def lower_load(em: Emitter, stmt) -> None:  # §5 global or shared load. Width 2 or 4 is a vector global load.
     index = linear_index(em, stmt.input, stmt.index)
-    nbytes = stmt.dtype.nbytes
+    nbytes = 4 if stmt.dtype is None else stmt.dtype.nbytes
     width = len(stmt.names)
     dests = [em.f32() for _ in stmt.names]
     if stmt.input in em.smem:
@@ -243,12 +267,19 @@ def lower_assign(em: Emitter, stmt) -> None:  # §5 add, multiply, divide, and r
 
 
 def lower_write(em: Emitter, stmt) -> None:  # §5 global or shared store. Width 2 or 4 is a vector global store.
-    if stmt.atomic:
-        raise CompileError("atomic stores are not lowered yet")
     index = linear_index(em, stmt.output, stmt.index)
     nbytes = stmt.value_dtype.nbytes
     regs = [em.lookup(n) for n in stmt.values]
     width = len(regs)
+    if stmt.atomic:
+        if stmt.output in em.smem or width != 1:
+            raise CompileError("only a scalar global atomic add is lowered")
+        if index is None:
+            addr = em.ptrs[stmt.output]
+        else:
+            addr = address_of(em, stmt.output, index, nbytes)
+        em.emit(f"\tred.global.add.f32 [{addr}], {regs[0]};")
+        return
     if stmt.output in em.smem:
         if width != 1:
             raise CompileError("vector shared stores are not lowered")
@@ -285,6 +316,34 @@ def lower_accum(em: Emitter, stmt) -> None:  # §5 fold one value into the add a
     acc = em.lookup(stmt.name)
     val = em.lookup(stmt.value)
     em.emit(f"\tadd.f32 {acc}, {acc}, {val};")
+
+
+def lower_init(em: Emitter, stmt) -> None:  # §5 one zero before the loops. A later Accum folds into it.
+    if stmt.name in em.ssa:
+        raise CompileError(f"duplicate init {stmt.name}")
+    if float(stmt.identity) != 0.0:
+        raise CompileError(f"unsupported init identity {stmt.identity}")
+    reg = em.f32()
+    em.emit(f"\tmov.f32 {reg}, 0f00000000;")
+    em.bind(stmt.name, reg)
+
+
+def lower_loop(em: Emitter, loop) -> None:  # §5 counted loop from 0, step 1. Init is the seed.
+    i = em.b32()
+    em.emit(f"\tmov.u32 {i}, 0;")
+    em.axes[loop.axis.name] = i
+    head = em.label("LOOP")
+    end = em.label("LOOP_END")
+    bound = as_int(loop.axis.extent)
+    em.emit(f"{head}:")
+    pred = em.pred()
+    em.emit(f"\tsetp.ge.s32 {pred}, {i}, {bound};")
+    em.emit(f"\t@{pred} bra {end};")
+    for stmt in loop.body:
+        lower_stmt(em, stmt)
+    em.emit(f"\tadd.s32 {i}, {i}, 1;")
+    em.emit(f"\tbra {head};")
+    em.emit(f"{end}:")
 
 
 def lower_strided_loop(em: Emitter, loop) -> None:  # §5 stride the axis. Accumulators start before the loop.
@@ -326,14 +385,32 @@ def lower_warp_shuffle(em: Emitter, stmt) -> None:  # §5 one add butterfly acro
         offset //= 2
 
 
-def lower_smem(em: Emitter, stmt) -> None:  # §5 one static .shared buffer, four bytes per float.
+def smem_align(stmt) -> int:  # §1 align 0 is the static default of 4. Any other IR value is used as written.
+    align = int(stmt.align)
+    return 4 if align == 0 else align
+
+
+def lower_smem(em: Emitter, stmt) -> None:  # §1 static buffer, or a byte offset into one dynamic pool.
     if stmt.dtype != "float":
         raise CompileError(f"unsupported shared dtype {stmt.dtype}")
     extents = tuple(as_int(e) for e in stmt.extents)
     count = 1
     for extent in extents:
         count *= extent
-    em.shared.append(f".shared .align 4 .b8 {stmt.name}[{count * 4}];")
+    nbytes = count * 4
+    align = smem_align(stmt)
+    if em.smem_bytes == 0:
+        em.shared.append(f".shared .align {align} .b8 {stmt.name}[{nbytes}];")
+        em.smem_off[stmt.name] = 0
+    else:
+        if not any(line.startswith(".extern .shared") for line in em.shared):
+            em.shared.append(".extern .shared .align 16 .b8 _smem_pool[];")
+        start = em.smem_used
+        if start % align:
+            start += align - (start % align)
+        em.smem_off[stmt.name] = start
+        em.smem_used = start + nbytes
+        em.smem_symbol[stmt.name] = "_smem_pool"
     em.smem.add(stmt.name)
     em.shapes[stmt.name] = extents
 
@@ -389,6 +466,33 @@ def lower_tree_halve(em: Emitter, stmt) -> None:  # §5 shared-memory tree of on
     em.emit(f"\tld.shared.f32 {acc}, [{base}];")
 
 
+def lower_cp_async_copy(em: Emitter, stmt) -> None:  # §5 16-byte cg copy, or ca for 4 or 8. lane_rows is not the stride.
+    if stmt.swizzle != "NONE":
+        raise CompileError(f"unsupported cp.async swizzle {stmt.swizzle}")
+    nbytes = int(stmt.nbytes)
+    if nbytes not in (4, 8, 16):
+        raise CompileError(f"unsupported cp.async size {nbytes}")
+    index = linear_index(em, stmt.smem, stmt.smem_index)
+    if stmt.lane_index:
+        lane = linear_index(em, stmt.smem, stmt.lane_index)
+        if index is None:
+            index = lane
+        elif lane is not None:
+            both = em.b32()
+            em.emit(f"\tadd.s32 {both}, {index}, {lane};")
+            index = both
+    saddr = shared_addr(em, stmt.smem, index, 4)
+    gindex = linear_index(em, stmt.src, stmt.src_index)
+    if gindex is None:
+        gaddr = em.ptrs[stmt.src]
+    else:
+        gaddr = address_of(em, stmt.src, gindex, 4)
+    if nbytes == 16:
+        em.emit(f"\tcp.async.cg.shared.global [{saddr}], [{gaddr}], 16;")
+    else:
+        em.emit(f"\tcp.async.ca.shared.global [{saddr}], [{gaddr}], {nbytes};")
+
+
 def lower_stmt(em: Emitter, stmt) -> None:  # §5 one translation per statement kind, including Sync.
     kind = type(stmt).__name__
     if kind == "Load":
@@ -411,6 +515,16 @@ def lower_stmt(em: Emitter, stmt) -> None:  # §5 one translation per statement 
         em.emit(f"\tbar.sync {int(stmt.barrier_id)};")
     elif kind == "TreeHalve":
         lower_tree_halve(em, stmt)
+    elif kind == "Init":
+        lower_init(em, stmt)
+    elif kind == "Loop":
+        lower_loop(em, stmt)
+    elif kind == "CpAsyncCopy":
+        lower_cp_async_copy(em, stmt)
+    elif kind == "CpAsyncCommit":
+        em.emit("\tcp.async.commit_group;")
+    elif kind == "CpAsyncWait":
+        em.emit(f"\tcp.async.wait_group {int(stmt.group)};")
     else:
         raise CompileError(f"unsupported statement {kind}")
 
@@ -452,8 +566,10 @@ def lower_tile(em: Emitter, tile) -> None:  # §4 thread id, axis decode, and ti
 def compile_kernel(ir_path: Path) -> str:
     graph = Graph.from_dict(json.loads(ir_path.read_text()))
     op = kernel_op(graph)
-    order = arg_order(ir_path, op.name)
+    launch = kernel_launch(ir_path, op.name)
+    order = list(launch["arg_order"])
     em = Emitter()
+    em.smem_bytes = int(launch["smem_bytes"])
     record_shapes(em, graph)
 
     # §4 Prologue: pointer parameters → global addresses.
@@ -468,6 +584,10 @@ def compile_kernel(ir_path: Path) -> str:
     if len(body) != 1 or type(body[0]).__name__ != "Tile":
         raise CompileError("expected a single Tile as the kernel body")
     lower_tile(em, body[0])
+    if em.smem_bytes and em.smem_used != em.smem_bytes:
+        raise CompileError(
+            f"shared pool is {em.smem_used} bytes, meta.json smem_bytes is {em.smem_bytes}"
+        )
     em.emit("\tret;")  # §6 Epilogue.
 
     params = ",\n".join(f"\t.param .u64 param_{name}" for name in order)

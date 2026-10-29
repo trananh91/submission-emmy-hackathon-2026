@@ -2,9 +2,9 @@
 
 `compile.py` lowers one Kernel IR to PTX. `main` checks that it was given a single path, `compile_kernel` builds the text, and stdout receives the PTX. Statement kinds are lowered as they appear. There is no category switch.
 
-The output is six parts. The compiler generates the prologue, the body, and the return while counting registers, then writes the header, any static shared buffers, the entry, and the register declarations in front of that text.
+The output is six parts. The compiler generates the prologue, the body, and the return while counting registers, then writes the header, any shared buffers, the entry, and the register declarations in front of that text.
 
-1. **[Module header.](#1-module-header)** Declares the language level and the kind of machine the program is for. Static shared buffers, when the IR has them, are printed here too.
+1. **[Module header.](#1-module-header)** Declares the language level and the kind of machine the program is for. Shared buffers, when the IR has them, are printed here too.
 2. **[Kernel entry and parameters.](#2-kernel-entry-and-parameters)** The name from the IR, and one pointer parameter per name in the launch file, in that order.
 3. **[Register declarations.](#3-register-declarations)** Storage private to each thread, separated by the kind of value it holds: truth values, floats, indexes, and addresses. Counted while generating the body, then written here.
 4. **[Prologue.](#4-prologue)** Bring the pointers into thread-local storage, turn them into addresses the body can use, and compute this thread's id. Lane and warp are computed later, the first time a statement needs them.
@@ -14,7 +14,7 @@ The output is six parts. The compiler generates the prologue, the body, and the 
 | Part | [`compile.py`](../compile.py) |
 |---|---|
 | §1 Module header | `compile_kernel` (`.version`, `.target`, `.address_size`, then any `.shared` lines) |
-| §2 Entry and parameters | `kernel_op`, `arg_order`, `compile_kernel` |
+| §2 Entry and parameters | `kernel_op`, `kernel_launch`, `arg_order`, `compile_kernel` |
 | §3 Register declarations | `Emitter.f32` / `b32` / `b64` / `pred`, printed in `compile_kernel` |
 | §4 Prologue | `compile_kernel` (pointers), `lower_tile` (thread id, axis decode, tile guard), `ensure_lane_warp` |
 | §5 Body | `lower_stmt` and each `lower_*`, `compile_index`, `linear_index`, `compile_pred`, `address_of`, `shared_addr`, `record_shapes`, `Emitter.bind` / `lookup` |
@@ -28,13 +28,17 @@ The output is six parts. The compiler generates the prologue, the body, and the 
 - `.target sm_89` — the machine the program is for
 - `.address_size 64`
 
-`lower_smem` records one `.shared .align 4 .b8` line per `Smem` statement. `compile_kernel` prints those lines after the header and before the entry. A pointwise kernel records none, so nothing is printed between the header and the entry.
+`kernel_launch` reads `smem_bytes` from the same `meta.json` record as the parameter list. `lower_smem` uses that number, and `smem_align` turns an IR alignment of 0 into 4.
+
+When `smem_bytes` is 0, each `Smem` is one static line, `.shared .align N .b8 name[count * 4]`. `N` is 4 when the IR says `align=0`, and the IR value otherwise. When `smem_bytes` is not 0, the kernel declares one pool, `.extern .shared .align 16 .b8 _smem_pool[]`, and no static copy of those bytes. The buffers are packed in IR order. Each start is rounded up to that statement's alignment, and the packed total must equal `smem_bytes`.
+
+`compile_kernel` prints those lines after the header and before the entry. A pointwise kernel records none, so nothing is printed between the header and the entry.
 
 ## 2. Kernel entry and parameters
 
 `kernel_op` finds the `KernelOp` in the graph. The entry name is `op.name` from the IR.
 
-`arg_order` reads the sibling `meta.json` and uses `arg_order` for the kernel whose `entry` matches that name. Each name becomes one `.param .u64 param_<name>`, in that order. The launch file decides the parameter list. The IR does not.
+`kernel_launch` reads the sibling `meta.json` and returns the kernel whose `entry` matches that name. `arg_order` is that record's parameter list. The same record's `smem_bytes` is the shared placement in §1. Each name becomes one `.param .u64 param_<name>`, in that order. The launch file decides the parameter list. The IR does not.
 
 ## 3. Register declarations
 
@@ -75,21 +79,26 @@ with `mad.lo.s32`. It keeps `%tid.x` so lane and warp can be derived from it.
 
 **Shapes.** `record_shapes` stores each buffer shape from the graph. `linear_index` uses it when a load or store has more than one index: row-major, trailing dimension fastest. One index is compiled as itself. An empty index is the base pointer.
 
-**Indexes.** `compile_index` lowers a `Var` to a tile axis, `lane`, or `warp`, a `Literal` to `mov.u32`, and `+` / `*` to `add.s32` / `mul.lo.s32`. `compile_pred` lowers `==` / `!=` to `setp.eq.s32` / `setp.ne.s32`.
+**Indexes.** `compile_index` lowers a `Var` to a tile axis, `lane`, or `warp`, and a `Literal` to `mov.u32`. `+`, `-`, `*`, `/`, and `%` become `add.s32`, `sub.s32`, `mul.lo.s32`, `div.s32`, and `rem.s32`. A `TernaryExpr` compiles both sides and selects with `selp.b32 dest, if_true, if_false, pred`. `compile_pred` lowers `==`, `!=`, and `<` to `setp.eq.s32`, `setp.ne.s32`, and `setp.lt.s32`.
 
-**Addresses.** `address_of` scales the index by the element size (`mul.wide.s32`) and adds it to the global pointer. `shared_addr` moves the shared symbol into a 32-bit register and, when there is an index, adds `index * element size` with `mul.lo.s32` and `add.s32`.
+**Addresses.** `address_of` scales the index by the element size (`mul.wide.s32`) and adds it to the global pointer. `shared_addr` moves the static symbol, or `_smem_pool` when the buffer is dynamic, into a 32-bit register. A non-zero byte offset is added. When there is an index, `index * element size` follows, with `mul.lo.s32` and `add.s32`.
 
 **Statements currently lowered:**
 
 | IR | PTX |
 |---|---|
-| `Load` | `ld.global.f32`, or `ld.global.v2.f32` / `v4.f32` when a global load names 2 or 4 values. A shared buffer uses `ld.shared.f32`. Each name is bound to an `%f` register. |
+| `Load` | `ld.global.f32`, or `ld.global.v2.f32` / `v4.f32` when a global load names 2 or 4 values. A shared buffer uses `ld.shared.f32`. A missing `dtype` uses 4 bytes. Each name is bound to an `%f` register. |
 | `Assign` | `add` → `add.f32`, `multiply` → `mul.f32`, `divide` → `div.rn.f32`, `relu` → `max.f32` against zero. Anything else is refused. |
-| `Write` | `st.global.f32`, or a `v2` / `v4` store. A shared buffer is one `st.shared.f32`. An empty index stores through the pointer itself. |
+| `Write` | `st.global.f32`, or a `v2` / `v4` store. A shared buffer is one `st.shared.f32`. An empty index stores through the pointer itself. One global value with `atomic` set is `red.global.add.f32`. An atomic vector or an atomic shared store is refused. |
 | `StridedLoop` | A header label, `setp.ge.s32` against the axis extent, the body, then `add.s32` of the step and a branch back. The loop index is a copy of `start`, so the tile axis is left alone. |
-| `Accum` | `add.f32` into the same register. The identity `0f00000000` is moved once, before the loop header, so the first iteration reads a defined register. Any op other than `add` is refused. |
+| `Loop` | The same header with start 0 and step 1. It does not seed accumulators. |
+| `Init` | `mov.f32` of `0f00000000` into a new register, before the loops that fold it. Any other identity is refused. A second `Init` of the same name is refused. |
+| `Accum` | `add.f32` into the same register. The identity `0f00000000` is moved once, before the loop header, so the first iteration reads a defined register. If `Init` already bound the name, that move is skipped. Any op other than `add` is refused. |
 | `WarpShuffle` | One `add` state. `shfl.sync.bfly.b32` at offsets `length/2`, `length/4`, … `1`, then `add.f32` of the shuffled value. A bit cast (`mov.b32`) moves the float through the shuffle. |
-| `Smem` | Float only. One `.shared .align 4 .b8 name[count * 4]` line, and the name is recorded so later loads and stores use the shared address. |
+| `Smem` | Float only. Static when `smem_bytes` is 0, with alignment 4 where the IR says 0. Otherwise one dynamic pool and a byte offset per name. The shape is recorded either way. |
+| `CpAsyncCopy` | `cp.async.cg.shared.global` for 16 bytes, and `cp.async.ca.shared.global` for 4 or 8. The shared index is `smem_index`, plus `lane_index` when that pair is present, row-major on the buffer shape. `lane_rows` is not the stride. Any other size, or a `swizzle` other than `NONE`, is refused. |
+| `CpAsyncCommit` | `cp.async.commit_group`. |
+| `CpAsyncWait` | `cp.async.wait_group` of the IR group. |
 | `Cond` | `@!%p bra` around the body. An else body branches to a join label. |
 | `Sync` | `bar.sync` of the IR barrier id. |
 | `TreeHalve` | One `add` buffer. `span` runs from `length/2` down to `1`. A thread whose `tid_var` is at least `span` skips the update. Every thread then `bar.sync`. After the last span, every thread loads slot 0 into the accumulator. |
@@ -103,5 +112,6 @@ with `mad.lo.s32`. It keeps `%tid.x` so lane and warp can be derived from it.
 For now, the architecture proposed above could cover:
 - Category 1-pointwise: one `Tile`, one axis, elementwise `add`, `multiply`, and `relu`, and vector loads and stores of width 1, 2, or 4.
 - Category 2-reductions: `StridedLoop`, one `add` accumulator, `WarpShuffle`, `Smem`, `Cond`, `Sync`, and `TreeHalve`, plus `divide`. A tile may have more than one axis.
+- Category 3-matmul: `Init` of an `add` accumulator, `Loop`, `CpAsyncCopy` / `CpAsyncCommit` / `CpAsyncWait` with `swizzle='NONE'`, static shared when `smem_bytes` is 0 and one dynamic pool otherwise, and a scalar `red.global.add.f32`. Index expressions also include `-`, `/`, `%`, and `TernaryExpr`.
 
 Raises `CompileError` where not cover yet.
